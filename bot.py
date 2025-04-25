@@ -15,6 +15,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from dotenv import load_dotenv
+import pytz
 
 # Configure logging
 load_dotenv()
@@ -99,6 +100,9 @@ COMBINED_MENU = ReplyKeyboardMarkup([
     ["📊 Status", "🔍 History"],
     ["⬅️ Main Menu"]
 ], resize_keyboard=True)
+
+# Define UAE time zone (UTC+4)
+UAE_TZ = pytz.timezone("Asia/Dubai")
 
 # Retry decorator for Google Sheets operations
 def retry_gsheet_operation(max_attempts=3, backoff_factor=2):
@@ -351,12 +355,21 @@ async def history_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not logs:
             return await update.message.reply_text("🔍 No history records found (no data rows).", reply_markup=ADMIN_MENU)
         
+        # Show the latest 10 entries with the new timestamp format
         latest = logs[-10:]
         lines = [
-            f'{r["Timestamp"]} - {r["Driver Name"]} {"took" if r["Action"] == "out" else "returned"} {r["Car Plate"]}'
+            f'{datetime.strptime(r["Timestamp"], "%Y-%m-%d %H:%M").astimezone(UAE_TZ).strftime("%d-%m-%Y, %I:%M %p")} - {r["Driver Name"]} {"took" if r["Action"] == "out" else "returned"} {r["Car Plate"]}'
             for r in latest
         ]
         await update.message.reply_text("🔍 Latest History:\n\n" + "\n".join(lines), reply_markup=ADMIN_MENU)
+        
+        # Prompt for search
+        context.user_data["await"] = "search_logs"
+        await update.message.reply_text(
+            "🔍 Enter the car plate and date to search logs (format: CAR_PLATE, DD-MM-YYYY)\n"
+            "Example: 1111111, 25-04-2025",
+            reply_markup=ADMIN_MENU
+        )
     except gspread.exceptions.WorksheetNotFound:
         logger.error(f"Log worksheet '{LOG_WORKSHEET_NAME}' not found")
         await update.message.reply_text(f"❌ Error: Log worksheet '{LOG_WORKSHEET_NAME}' not found in Google Sheets. Please check the spreadsheet configuration.", reply_markup=ADMIN_MENU)
@@ -587,6 +600,40 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await driver_list_menu(update, context)
             except ValueError:
                 await update.message.reply_text("❌ Invalid format. Use: Name, TelegramUserID (e.g., John Doe, 123456789)", reply_markup=ADMIN_MENU)
+        if action == "search_logs":
+            try:
+                # Parse the input: expected format "CAR_PLATE, DD-MM-YYYY"
+                car_plate, date_str = map(str.strip, text.split(","))
+                car_plate = car_plate.upper()
+                search_date = datetime.strptime(date_str, "%d-%m-%Y").date()
+                
+                # Fetch logs and filter by car plate and date
+                logs = sheet_log.get_all_records()
+                filtered_logs = [
+                    log for log in logs
+                    if log["Car Plate"].upper() == car_plate and
+                    datetime.strptime(log["Timestamp"], "%Y-%m-%d %H:%M").astimezone(UAE_TZ).date() == search_date
+                ]
+                
+                if not filtered_logs:
+                    return await update.message.reply_text(f"🔍 No records found for car {car_plate} on {date_str}.", reply_markup=ADMIN_MENU)
+                
+                # Format the filtered logs with the new timestamp format
+                lines = [
+                    f'{datetime.strptime(log["Timestamp"], "%Y-%m-%d %H:%M").astimezone(UAE_TZ).strftime("%d-%m-%Y, %I:%M %p")} - {log["Driver Name"]} {"took" if log["Action"] == "out" else "returned"} {log["Car Plate"]}'
+                    for log in filtered_logs
+                ]
+                await update.message.reply_text(f"🔍 Search Results for {car_plate} on {date_str}:\n\n" + "\n".join(lines), reply_markup=ADMIN_MENU)
+            except ValueError as e:
+                logger.error(f"Error parsing search input: {e}")
+                await update.message.reply_text(
+                    "❌ Invalid format. Please use: CAR_PLATE, DD-MM-YYYY\n"
+                    "Example: 1111111, 25-04-2025",
+                    reply_markup=ADMIN_MENU
+                )
+            except Exception as e:
+                logger.error(f"Error in search_logs: {e}")
+                await update.message.reply_text("❌ Error searching logs. Please try again.", reply_markup=ADMIN_MENU)
     except Exception as e:
         logger.error(f"Error in text_handler: {e}")
         await update.message.reply_text("❌ An error occurred. Please try again.", reply_markup=ADMIN_MENU)
@@ -599,7 +646,12 @@ async def on_car_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         action, plate = query.data.split("|")
         user = update.effective_user.first_name
         user_id = update.effective_user.id
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        # Get current time in UAE time zone
+        ts = datetime.now(UAE_TZ)
+        # Format the timestamp for display
+        ts_display = ts.strftime("%d-%m-%Y, %I:%M %p")
+        # Format the timestamp for storage in the Log worksheet
+        ts_storage = ts.strftime("%Y-%m-%d %H:%M")
         normalized_plate = str(plate).strip().upper()
         
         if action == "take":
@@ -618,21 +670,21 @@ async def on_car_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"⚠️ Car {plate} is already in use by another driver.", reply_markup=menu)
                 return
             # Log the take action
-            sheet_log.append_row([ts, user, plate, "out"])
-            logger.debug(f"Logged take action: {user} took {plate} at {ts}")
-            await query.edit_message_text(f"✅ You took {plate} at {ts}")
+            sheet_log.append_row([ts_storage, user, plate, "out"])
+            logger.debug(f"Logged take action: {user} took {plate} at {ts_storage}")
+            await query.edit_message_text(f"✅ You took {plate} at {ts_display}")
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"🚗 {plate} taken by {user} at {ts}"
+                text=f"🚗 {plate} taken by {user} at {ts_display}"
             )
             logger.debug(f"Notification sent to admin chat {ADMIN_CHAT_ID}: {plate} taken by {user}")
         else:
-            sheet_log.append_row([ts, user, plate, "in"])
-            logger.debug(f"Logged return action: {user} returned {plate} at {ts}")
-            await query.edit_message_text(f"↩️ You returned {plate} at {ts}")
+            sheet_log.append_row([ts_storage, user, plate, "in"])
+            logger.debug(f"Logged return action: {user} returned {plate} at {ts_storage}")
+            await query.edit_message_text(f"↩️ You returned {plate} at {ts_display}")
             await context.bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
-                text=f"✅ {plate} returned by {user} at {ts}"
+                text=f"✅ {plate} returned by {user} at {ts_display}"
             )
             logger.debug(f"Notification sent to admin chat {ADMIN_CHAT_ID}: {plate} returned by {user}")
     except Exception as e:
